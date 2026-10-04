@@ -1,0 +1,17 @@
+{
+  "name": "dsh-media-suite",
+  "private": true,
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 多模态生成插件族：图像/语音/视频统一生成协议 + 可插拔 Provider",
+  "scripts": {
+    "build": "pnpm -r --filter './packages/*' run build",
+    "test": "pnpm -r --filter './packages/*' run --if-present test"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

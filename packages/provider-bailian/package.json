@@ -1,0 +1,23 @@
+{
+  "name": "dsh-media-bailian",
+  "version": "0.1.0",
+  "description": "dsh-media-core 的阿里云百炼 Provider：通义万相文生图/图像编辑/图生视频、CosyVoice 语音合成。",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": ["lib", "README.md"],
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "keywords": ["dsh-plugin", "deepseek-harness", "cordis", "bailian", "dashscope", "wanx", "cosyvoice"],
+  "dependencies": { "dsh-media-core": "workspace:*" },
+  "devDependencies": { "@types/node": "^22.0.0", "typescript": "^5.6.0" },
+  "dsh": {
+    "bundle": {
+      "name": "media-bailian",
+      "requires": ["media-core"],
+      "config": {
+        "apiKey": { "type": "string", "description": "DashScope API Key，建议用 ${DASHSCOPE_API_KEY}" },
+        "baseUrl": { "type": "string", "default": "https://dashscope.aliyuncs.com" },
+        "models": { "type": "object", "description": "各模态模型名覆盖" }
+      }
+    }
+  }
+}

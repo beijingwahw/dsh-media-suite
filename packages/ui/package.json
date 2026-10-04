@@ -1,0 +1,22 @@
+{
+  "name": "dsh-media-ui",
+  "version": "0.1.0",
+  "description": "dsh-media-core 的 Web UI 面板：任务看板、媒体产物内联预览、引用到对话、失败重试、预算仪表。",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": ["lib", "README.md"],
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "keywords": ["dsh-plugin", "deepseek-harness", "cordis", "ui", "media"],
+  "dependencies": { "dsh-media-core": "workspace:*" },
+  "devDependencies": { "@types/node": "^22.0.0", "typescript": "^5.6.0" },
+  "dsh": {
+    "bundle": {
+      "name": "media-ui",
+      "requires": ["media-core"],
+      "config": {
+        "panelTitle": { "type": "string", "default": "媒体生成" },
+        "refreshMs": { "type": "number", "default": 2000 }
+      }
+    }
+  }
+}

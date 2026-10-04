@@ -1,0 +1,23 @@
+{
+  "name": "dsh-media-comfyui",
+  "version": "0.1.0",
+  "description": "dsh-media-core 的本地 ComfyUI Provider：工作流 JSON 模板参数化注入，支持图像/视频本地零 API 成本生成。",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": ["lib", "templates", "README.md"],
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "keywords": ["dsh-plugin", "deepseek-harness", "cordis", "comfyui", "stable-diffusion", "local"],
+  "dependencies": { "dsh-media-core": "workspace:*" },
+  "devDependencies": { "@types/node": "^22.0.0", "typescript": "^5.6.0" },
+  "dsh": {
+    "bundle": {
+      "name": "media-comfyui",
+      "requires": ["media-core"],
+      "config": {
+        "endpoint": { "type": "string", "default": "http://127.0.0.1:8188" },
+        "workflows": { "type": "object", "description": "模态 → 工作流 JSON（API 格式）文件路径或内联对象，覆盖内置模板" },
+        "timeoutSec": { "type": "number", "default": 1800 }
+      }
+    }
+  }
+}
