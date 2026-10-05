@@ -132,6 +132,35 @@ pnpm test         # core 单测（状态机/预算/队列端到端，vitest）
 
 测试从 13 例扩充至 **35 例**，全部通过。
 
+## 真实数据接地（2026-10-05 核实）
+
+代码中的模型名、端点与单价均已对照官方文档核实：
+
+| 项目 | 值 | 来源 |
+|---|---|---|
+| 百炼文生图 | `wanx2.1-t2i-turbo`，0.14 元/张，异步 HTTP | [官方模型页](https://help.aliyun.com/zh/model-studio/wanx2-1-t2i-turbo) |
+| 百炼图像编辑 | `wanx2.1-imageedit`，0.14 元/张 | [百炼收费标准汇总](https://developer.aliyun.com/article/1763163) |
+| 百炼文生视频 | `wanx2.1-t2v-turbo`，480P/720P 0.24 元/秒 | 同上 |
+| 百炼 TTS | `qwen3-tts-flash`，0.8 元/万字符，REST 同步 | [官方模型页](https://help.aliyun.com/zh/model-studio/qwen3-tts-flash) |
+| OpenAI 图像 | `gpt-image-1` 低档 $0.011/张 ≈ 0.08 元 | OpenAI API 定价页 |
+| OpenAI TTS | `gpt-4o-mini-tts` $0.6/百万字符 ≈ 0.0043 元/千字符 | OpenAI API 定价页 |
+
+关键修正：**cosyvoice 系列仅支持 WebSocket 接口**，HTTP 链路调不通，TTS 默认模型已切换为 REST 可用的 `qwen3-tts-flash`（音色 Cherry/Serena/Ethan/Chelsie 等）。
+
+计费口径注意：百炼 TTS 按「1 汉字=2 字符」计，本套件按文本长度估算时中文实际成本约为估算 2 倍，预算请留余量；任务成功后按 provider 回传的真实 usage 结算。
+
+### 真实链路冒烟测试
+
+配置好 API Key 后，用 `scripts/smoke.mjs` 直接验证各家真实端点（不经过插件层，快速定位链路问题）：
+
+```bash
+DASHSCOPE_API_KEY=sk-xxx node scripts/smoke.mjs bailian-image   # 真实生成一张图（约 0.14 元）
+DASHSCOPE_API_KEY=sk-xxx node scripts/smoke.mjs bailian-tts     # 真实合成一段语音
+OPENAI_API_KEY=sk-xxx    node scripts/smoke.mjs openai-image
+COMFYUI_ENDPOINT=http://127.0.0.1:8188 node scripts/smoke.mjs comfyui-health
+node scripts/smoke.mjs all   # 跑所有已配置 Key 的项，产物在 ./smoke-output/
+```
+
 ## 已知限制与风险
 
 - **dsh 处于 developer preview**：本套件以 dsh v0.2.x 插件 API 为基线（Cordis `provide/on/emit/dispose` + `dsh.bundle` 声明）。宿主 UI 挂载点与工具注册接口可能变化，`core/index.ts` 与 `ui/index.ts` 已做多级回退（宿主服务 → 事件广播 → DOM 浮层），但大版本升级后仍需复核。

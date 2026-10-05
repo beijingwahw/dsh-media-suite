@@ -35,11 +35,18 @@ export interface Config {
   requestTimeoutMs?: number;
 }
 
+// 模型名均已在百炼官方文档核实（2026-10-05）：
+//  - wanx2.1-t2i-turbo：0.14 元/张，异步 HTTP
+//  - wanx2.1-imageedit：0.14 元/张，异步 HTTP
+//  - wanx2.1-t2v-turbo：480P/720P 0.24 元/秒，异步 HTTP
+//  - qwen3-tts-flash：0.8 元/万字符，非实时 HTTP（multimodal-generation 端点）
+// 注意：cosyvoice 系列仅支持 WebSocket 接口，本插件的 HTTP 链路不适用，
+// 故 TTS 默认走 qwen3-tts-flash；如需 cosyvoice 请自行桥接 WebSocket。
 const DEFAULT_MODELS: Record<Modality, string> = {
   image: 'wanx2.1-t2i-turbo',
   'image-edit': 'wanx2.1-imageedit',
   video: 'wanx2.1-t2v-turbo',
-  speech: 'cosyvoice-v2'
+  speech: 'qwen3-tts-flash'
 };
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -122,7 +129,7 @@ export class BailianProvider implements MediaProvider {
       '/api/v1/services/aigc/multimodal-generation/generation',
       {
         model: this.models.speech,
-        input: { text: req.prompt, voice: req.params.voice ?? 'longxiaochun' },
+        input: { text: req.prompt, voice: req.params.voice ?? 'Cherry' }, // qwen3-tts 音色：Cherry/Serena/Ethan/Chelsie 等
         parameters: { format: req.params.format ?? 'mp3', speech_rate: req.params.speed ?? 1 }
       },
       { async: false }

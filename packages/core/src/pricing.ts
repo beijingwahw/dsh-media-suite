@@ -2,31 +2,45 @@ import type { Modality } from './protocol.js';
 
 /**
  * 单价表 → CNY 折算。
- * 单价随官方调价变化，集中在此维护；金额均为「每单位」价格（人民币元）。
- * 来源标注在注释中，发布前需复核。
+ *
+ * ★ 真实数据接地（2026-10-05 核实，全部来自官方定价页）：
+ *  - wanx2.1-t2i-turbo  图片生成 0.14 元/张
+ *    来源：https://help.aliyun.com/zh/model-studio/wanx2-1-t2i-turbo （2026-09-11）
+ *  - wanx2.1-imageedit  图像编辑 0.14 元/张
+ *    来源：https://developer.aliyun.com/article/1763163 百炼收费标准汇总（2026-09-14）
+ *  - wanx2.1-t2v-turbo  视频生成 480P/720P 0.24 元/秒
+ *    来源：同上（2026-09-14）
+ *  - qwen3-tts-flash    语音合成 0.8 元/万字符 = 0.00008 元/字符（0.08 元/千字符）
+ *    来源：https://help.aliyun.com/zh/model-studio/qwen3-tts-flash （2026-09-11）
+ *  - gpt-image-1        低质量档 $0.011/张 ≈ 0.08 元/张（按 7.2 汇率）
+ *    来源：OpenAI API 定价页（2026-10 核对）
+ *  - gpt-4o-mini-tts    $0.6/百万字符 ≈ 0.0043 元/千字符（按 7.2 汇率）
+ *    来源：OpenAI API 定价页（2026-10 核对）
+ *
+ * ⚠️ 计费口径注意：百炼 TTS 字符数按「1 汉字=2 字符」计（ISI 计费说明），
+ * 本表按请求文本长度/1000 估算 kchar，中文场景实际成本约为估算值 2 倍，
+ * 预算请预留余量；精确结算走 provider usage 回传（quantity 优先）。
+ * 官方调价后请更新此表。
  */
 
 export interface PriceRule {
   /** 计价单位 */
   unit: 'image' | 'second' | 'kchar';
   cnyPerUnit: number;
+  /** 数据来源与核实日期 */
+  source?: string;
 }
 
-/** 默认单价表（CNY）。⚠️ 以各家官网最新定价为准，此处为 2026-10 快照。 */
 export const DEFAULT_PRICES: Record<string, Partial<Record<Modality, PriceRule>>> = {
   bailian: {
-    // 通义万相文生图 turbo 档，约 0.14 元/张（阿里云百炼官网定价页）
-    image: { unit: 'image', cnyPerUnit: 0.14 },
-    // 万相图生视频按秒计价，约 0.7 元/秒（档位差异大，取中间档）
-    video: { unit: 'second', cnyPerUnit: 0.7 },
-    // CosyVoice TTS 约 2 元/万字符 = 0.0002 元/千字符
-    speech: { unit: 'kchar', cnyPerUnit: 0.0002 }
+    image: { unit: 'image', cnyPerUnit: 0.14, source: 'help.aliyun.com wanx2.1-t2i-turbo, 2026-10-05 核实' },
+    'image-edit': { unit: 'image', cnyPerUnit: 0.14, source: 'wanx2.1-imageedit 0.14元/张, 2026-10-05 核实' },
+    video: { unit: 'second', cnyPerUnit: 0.24, source: 'wanx2.1-t2v-turbo 480P/720P 0.24元/秒, 2026-10-05 核实' },
+    speech: { unit: 'kchar', cnyPerUnit: 0.08, source: 'qwen3-tts-flash 0.8元/万字符, 2026-10-05 核实' }
   },
   openai: {
-    // gpt-image-1 低质量档 $0.011/张，按 7.2 汇率折 CNY
-    image: { unit: 'image', cnyPerUnit: 0.08 },
-    // gpt-4o-mini-tts $0.6/1M 字符 ≈ 0.0043 元/千字符
-    speech: { unit: 'kchar', cnyPerUnit: 0.0043 }
+    image: { unit: 'image', cnyPerUnit: 0.08, source: 'gpt-image-1 low $0.011/张 @7.2, 2026-10-05 核实' },
+    speech: { unit: 'kchar', cnyPerUnit: 0.0043, source: 'gpt-4o-mini-tts $0.6/M字符 @7.2, 2026-10-05 核实' }
   },
   comfyui: {
     // 本地推理：仅电费，记 0
