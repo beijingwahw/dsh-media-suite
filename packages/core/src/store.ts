@@ -6,18 +6,21 @@ export interface TaskStore {
   insertTask(rec: TaskRecord): Promise<void>;
   updateTask(id: string, patch: Partial<TaskRecord>): Promise<void>;
   getTask(id: string): Promise<TaskRecord | undefined>;
-  listTasks(filter?: { status?: TaskStatus; sessionId?: string; limit?: number }): Promise<TaskRecord[]>;
+  listTasks(filter?: { status?: TaskStatus; sessionId?: string; limit?: number; before?: number }): Promise<TaskRecord[]>;
   /** 崩溃恢复：把中断的 submitted/running 任务重置为 pending */
   requeueInterrupted(): Promise<number>;
   insertArtifact(rec: ArtifactRecord): Promise<void>;
   listArtifacts(taskId?: string): Promise<ArtifactRecord[]>;
+  findArtifactByHash(hash: string): Promise<ArtifactRecord | undefined>;
+  findArtifactByPath(path: string): Promise<ArtifactRecord | undefined>;
+  deleteArtifact(id: string): Promise<void>;
   sumCostSince(ts: number): Promise<number>;
   close(): Promise<void>;
 }
 
 export class MemoryTaskStore implements TaskStore {
   private tasks = new Map<string, TaskRecord>();
-  private artifacts: ArtifactRecord[] = [];
+  private artifacts = new Map<string, ArtifactRecord>();
 
   async init(): Promise<void> {}
 
@@ -36,10 +39,11 @@ export class MemoryTaskStore implements TaskStore {
     return t ? { ...t } : undefined;
   }
 
-  async listTasks(filter?: { status?: TaskStatus; sessionId?: string; limit?: number }): Promise<TaskRecord[]> {
+  async listTasks(filter?: { status?: TaskStatus; sessionId?: string; limit?: number; before?: number }): Promise<TaskRecord[]> {
     let out = [...this.tasks.values()];
     if (filter?.status) out = out.filter((t) => t.status === filter.status);
     if (filter?.sessionId) out = out.filter((t) => t.sessionId === filter.sessionId);
+    if (filter?.before) out = out.filter((t) => t.createdAt < filter.before!);
     out.sort((a, b) => b.createdAt - a.createdAt);
     if (filter?.limit) out = out.slice(0, filter.limit);
     return out.map((t) => ({ ...t }));
@@ -58,20 +62,34 @@ export class MemoryTaskStore implements TaskStore {
   }
 
   async insertArtifact(rec: ArtifactRecord): Promise<void> {
-    this.artifacts.push({ ...rec });
+    this.artifacts.set(rec.id, { ...rec });
   }
 
   async listArtifacts(taskId?: string): Promise<ArtifactRecord[]> {
-    const out = taskId ? this.artifacts.filter((a) => a.taskId === taskId) : this.artifacts;
-    return out.map((a) => ({ ...a }));
+    const out = taskId ? [...this.artifacts.values()].filter((a) => a.taskId === taskId) : [...this.artifacts.values()];
+    return out.sort((a, b) => a.createdAt - b.createdAt).map((a) => ({ ...a }));
+  }
+
+  async findArtifactByHash(hash: string): Promise<ArtifactRecord | undefined> {
+    for (const a of this.artifacts.values()) if (a.hash === hash) return { ...a };
+    return undefined;
+  }
+
+  async findArtifactByPath(path: string): Promise<ArtifactRecord | undefined> {
+    for (const a of this.artifacts.values()) if (a.path === path) return { ...a };
+    return undefined;
+  }
+
+  async deleteArtifact(id: string): Promise<void> {
+    this.artifacts.delete(id);
   }
 
   async sumCostSince(ts: number): Promise<number> {
-    return this.tasks.values
-      ? [...this.tasks.values()]
-          .filter((t) => t.createdAt >= ts && typeof t.costCny === 'number')
-          .reduce((s, t) => s + (t.costCny ?? 0), 0)
-      : 0;
+    let s = 0;
+    for (const t of this.tasks.values()) {
+      if (t.createdAt >= ts && typeof t.costCny === 'number') s += t.costCny;
+    }
+    return s;
   }
 
   async close(): Promise<void> {}
@@ -110,13 +128,23 @@ export class SqliteTaskStore implements TaskStore {
         path TEXT NOT NULL,
         mime TEXT NOT NULL,
         bytes INTEGER NOT NULL,
+        hash TEXT,
         meta_json TEXT,
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-      CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_session_status ON tasks(session_id, status);
+      CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at);
       CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_hash ON artifacts(hash);
     `);
+    // 轻量迁移：旧库补 hash 列
+    try {
+      this.db.exec(`ALTER TABLE artifacts ADD COLUMN hash TEXT`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_artifacts_hash ON artifacts(hash)`);
+    } catch {
+      /* 列已存在，忽略 */
+    }
   }
 
   private get d(): import('better-sqlite3').Database {
@@ -173,11 +201,12 @@ export class SqliteTaskStore implements TaskStore {
     return row ? this.rowToTask(row) : undefined;
   }
 
-  async listTasks(filter?: { status?: TaskStatus; sessionId?: string; limit?: number }): Promise<TaskRecord[]> {
+  async listTasks(filter?: { status?: TaskStatus; sessionId?: string; limit?: number; before?: number }): Promise<TaskRecord[]> {
     const where: string[] = [];
     const params: Record<string, unknown> = {};
     if (filter?.status) { where.push('status = @status'); params.status = filter.status; }
     if (filter?.sessionId) { where.push('session_id = @sessionId'); params.sessionId = filter.sessionId; }
+    if (filter?.before) { where.push('created_at < @before'); params.before = filter.before; }
     const sql = `SELECT * FROM tasks ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY created_at DESC LIMIT @limit`;
     params.limit = filter?.limit ?? 100;
     return (this.d.prepare(sql).all(params) as Record<string, unknown>[]).map((r) => this.rowToTask(r));
@@ -193,21 +222,40 @@ export class SqliteTaskStore implements TaskStore {
   async insertArtifact(rec: ArtifactRecord): Promise<void> {
     this.d
       .prepare(
-        `INSERT INTO artifacts (id, task_id, kind, path, mime, bytes, meta_json, created_at)
-         VALUES (@id, @taskId, @kind, @path, @mime, @bytes, @metaJson, @createdAt)`
+        `INSERT INTO artifacts (id, task_id, kind, path, mime, bytes, hash, meta_json, created_at)
+         VALUES (@id, @taskId, @kind, @path, @mime, @bytes, @hash, @metaJson, @createdAt)`
       )
-      .run({ ...rec, metaJson: rec.metaJson ?? null });
+      .run({ ...rec, hash: rec.hash ?? null, metaJson: rec.metaJson ?? null });
+  }
+
+  private rowToArtifact(r: Record<string, unknown>): ArtifactRecord {
+    return {
+      id: r.id as string, taskId: r.task_id as string, kind: r.kind as ArtifactRecord['kind'],
+      path: r.path as string, mime: r.mime as string, bytes: r.bytes as number,
+      hash: (r.hash as string) ?? undefined,
+      metaJson: (r.meta_json as string) ?? undefined, createdAt: r.created_at as number
+    };
   }
 
   async listArtifacts(taskId?: string): Promise<ArtifactRecord[]> {
     const rows = taskId
       ? (this.d.prepare('SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at').all(taskId) as Record<string, unknown>[])
       : (this.d.prepare('SELECT * FROM artifacts ORDER BY created_at').all() as Record<string, unknown>[]);
-    return rows.map((r) => ({
-      id: r.id as string, taskId: r.task_id as string, kind: r.kind as ArtifactRecord['kind'],
-      path: r.path as string, mime: r.mime as string, bytes: r.bytes as number,
-      metaJson: (r.meta_json as string) ?? undefined, createdAt: r.created_at as number
-    }));
+    return rows.map((r) => this.rowToArtifact(r));
+  }
+
+  async findArtifactByHash(hash: string): Promise<ArtifactRecord | undefined> {
+    const row = this.d.prepare('SELECT * FROM artifacts WHERE hash = ? LIMIT 1').get(hash) as Record<string, unknown> | undefined;
+    return row ? this.rowToArtifact(row) : undefined;
+  }
+
+  async findArtifactByPath(path: string): Promise<ArtifactRecord | undefined> {
+    const row = this.d.prepare('SELECT * FROM artifacts WHERE path = ? LIMIT 1').get(path) as Record<string, unknown> | undefined;
+    return row ? this.rowToArtifact(row) : undefined;
+  }
+
+  async deleteArtifact(id: string): Promise<void> {
+    this.d.prepare('DELETE FROM artifacts WHERE id = ?').run(id);
   }
 
   async sumCostSince(ts: number): Promise<number> {

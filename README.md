@@ -101,6 +101,37 @@ pnpm build        # 全包 tsc 构建
 pnpm test         # core 单测（状态机/预算/队列端到端，vitest）
 ```
 
+## v0.2 深度优化（2026-10-05）
+
+**可靠性**
+- Provider 故障自动转移：路由时健康探测（30s 缓存），指定/默认 Provider 不可用自动降级到下一个候选，可用 `failover: false` 关闭
+- 错误分级重试：429/5xx/网络错误才进指数退避重试；参数、鉴权、能力缺失类错误立即 failed，不再白烧 3 次重试和预算
+- 自适应轮询：异步任务轮询间隔指数递增（3s→30s 封顶）+ 抖动，长视频任务大幅减少无效请求
+- 任务总超时看门狗：各模态可配置（默认 image 5min / speech 2min / video 30min），卡死任务自动失败并释放并发槽位
+
+**预算**
+- 预扣-结算模型：入队即预扣预估成本（在途占用额度），成功按实际结算、失败/取消自动释放，杜绝并发任务同时通过日预算检查导致超支
+- 真实计费量结算：Provider 回传 usage（张数/秒数/千字符）优先于预估单价结算
+
+**产物与存储**
+- 原子写入（临时文件 + rename）+ SHA-256 内容去重（相同产物复用文件）+ 同名冲突自动加哈希后缀
+- 可选保留策略：按数量/天数自动清理旧产物（`retention: { maxCount, maxAgeDays }`，默认关闭）
+- SQLite 补 sessionId+status / hash / created_at 索引，旧库自动轻量迁移；listTasks 支持游标分页
+
+**工具体验**
+- `generate_image` / `edit_image` / `generate_speech` 默认 `wait: true`：同步等待完成直接返回产物路径（超时自动转后台并返回 task_id），Agent 少一轮查询
+- 入参前置校验：非法 size/n/duration/speed/format 在入队前拒绝并返回可读错误，Agent 可自行修正
+
+**Provider**
+- bailian：错误码分类（内容审核/参数错误不重试）、全请求超时、本地路径参考图前置拒绝（提示改用公网 URL 或 comfyui）、task_metrics 进度估算
+- openai：全请求 AbortSignal 超时、dall-e-3 参数约束（n=1、quality/style 透传）、TTS 字符量回传结算
+- comfyui：/queue 排队位次真实进度、模板前置校验（未知占位符/缺输出节点提交前报错）、连接失败归类可重试
+
+**UI**
+- 事件驱动增量渲染（去掉 2s 全量轮询，保留 10s 低频对账兜底）、任务取消按钮、模态/状态筛选、成本列、进度条、空状态提示、产物详情缓存
+
+测试从 13 例扩充至 **35 例**，全部通过。
+
 ## 已知限制与风险
 
 - **dsh 处于 developer preview**：本套件以 dsh v0.2.x 插件 API 为基线（Cordis `provide/on/emit/dispose` + `dsh.bundle` 声明）。宿主 UI 挂载点与工具注册接口可能变化，`core/index.ts` 与 `ui/index.ts` 已做多级回退（宿主服务 → 事件广播 → DOM 浮层），但大版本升级后仍需复核。

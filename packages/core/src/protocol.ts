@@ -43,8 +43,10 @@ export interface ProviderTicket {
 export interface CostInfo {
   amount: number;
   currency: string;
-  /** 折算人民币，用于统一预算控制 */
+  /** 折算人民币；为 0 且带 quantity 时由 core Pricing 按单价表结算 */
   cny: number;
+  /** 提供方回传的真实计费量（张数/秒数/千字符数），用于精确结算 */
+  quantity?: number;
 }
 
 export interface TaskProgress {
@@ -99,6 +101,8 @@ export interface ArtifactRecord {
   path: string;
   mime: string;
   bytes: number;
+  /** 内容 SHA-256，用于去重 */
+  hash?: string;
   metaJson?: string;
   createdAt: number;
 }
@@ -116,4 +120,10 @@ export const STATUS_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
 
 export function canTransition(from: TaskStatus, to: TaskStatus): boolean {
   return STATUS_TRANSITIONS[from].includes(to);
+}
+
+export const TERMINAL_STATUSES: TaskStatus[] = ['succeeded', 'failed', 'canceled', 'rejected'];
+
+export function isTerminal(s: TaskStatus): boolean {
+  return TERMINAL_STATUSES.includes(s);
 }

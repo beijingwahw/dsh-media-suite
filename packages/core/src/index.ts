@@ -3,13 +3,14 @@
  *
  * dsh 处于 developer preview，插件宿主 API 可能变化。
  * 本入口对宿主做最小假设：
- *  - ctx.provide / ctx.on / ctx.dispose（Cordis 标准能力）
- *  - 工具注册优先走宿主 `tool-registry` 服务（若可用），否则退回事件广播，
+ *  - ctx.provide / ctx.on / ctx.emit / ctx.dispose（Cordis 标准能力）
+ *  - 工具注册优先走宿主 tool-registry 服务（若可用），否则退回事件广播，
  *    由 UI 或适配层拾取。
  */
 import { join } from 'node:path';
-import { ArtifactManager } from './artifacts.js';
+import { ArtifactManager, type RetentionPolicy } from './artifacts.js';
 import { Budget } from './budget.js';
+import { MediaError } from './errors.js';
 import { Pricing } from './pricing.js';
 import type { MediaProvider } from './protocol.js';
 import { TaskQueue } from './queue.js';
@@ -18,6 +19,7 @@ import { MediaService, TOOL_DEFS } from './tools.js';
 
 export * from './protocol.js';
 export * from './tools.js';
+export * from './errors.js';
 export { TaskQueue } from './queue.js';
 export { MemoryTaskStore, SqliteTaskStore } from './store.js';
 export { Budget, BudgetError } from './budget.js';
@@ -31,11 +33,20 @@ export interface Config {
   defaultProvider?: Record<string, string>;
   budget?: { dailyCNY?: number; perTaskCNY?: number };
   concurrency?: { image?: number; video?: number; speech?: number };
+  /** 各模态任务总超时（ms） */
+  timeouts?: { image?: number; video?: number; speech?: number };
+  /** Provider 故障自动转移（缺省 true） */
+  failover?: boolean;
   outputDir?: string;
   storage?: 'sqlite' | 'memory';
   dbFile?: string;
   maxRetries?: number;
   pollIntervalMs?: number;
+  pollMaxIntervalMs?: number;
+  /** 产物保留策略（默认关闭） */
+  retention?: RetentionPolicy;
+  /** wait=true 工具的同步等待上限（ms），超时转异步 */
+  waitTimeoutMs?: number;
 }
 
 /** Cordis 上下文中本插件实际用到的最小能力面 */
@@ -60,15 +71,20 @@ export function Plugin(ctx: PluginContext, config: Config = {}): MediaService {
     store = new SqliteTaskStore(config.dbFile ?? join(dshHome, 'media.db'));
   }
 
-  // ---- 产物管理：落盘 + 会话事件注入 ----
-  const artifactManager = new ArtifactManager({
-    outputDir: config.outputDir ?? 'assets/media',
-    workspaceDir,
-    onSessionEvent: (e) => ctx.emit?.('media/artifact:created', e)
-  });
-
   const pricing = new Pricing();
   const budget = new Budget(store, config.budget ?? {});
+
+  // ---- 产物管理：原子写入 + 哈希去重 + 保留策略 + 会话事件注入 ----
+  const artifactManager = new ArtifactManager(
+    {
+      outputDir: config.outputDir ?? 'assets/media',
+      workspaceDir,
+      retention: config.retention,
+      onSessionEvent: (e) => ctx.emit?.('media/artifact:created', e)
+    },
+    store
+  );
+
   const queue = new TaskQueue(
     store,
     budget,
@@ -77,17 +93,25 @@ export function Plugin(ctx: PluginContext, config: Config = {}): MediaService {
     {
       concurrency: config.concurrency ?? {},
       maxRetries: config.maxRetries ?? 3,
-      pollIntervalMs: config.pollIntervalMs ?? 3000
+      pollIntervalMs: config.pollIntervalMs ?? 3000,
+      pollMaxIntervalMs: config.pollMaxIntervalMs ?? 30_000,
+      failover: config.failover ?? true,
+      timeouts: config.timeouts ?? {}
     },
     config.defaultProvider ?? {}
   );
 
   const media = new MediaService(queue, store, budget, pricing);
+  const waitTimeoutMs = config.waitTimeoutMs ?? 180_000;
 
   // ---- 初始化（含崩溃恢复）----
   const ready = store.init().then(async () => {
     const n = await store.requeueInterrupted();
     if (n > 0) console.warn(`[media-core] 恢复 ${n} 个中断任务，重新入队`);
+    if (config.retention) {
+      const pruned = await artifactManager.prune().catch(() => 0);
+      if (pruned > 0) console.warn(`[media-core] 保留策略清理 ${pruned} 个过期产物`);
+    }
   });
 
   // ---- Provider 热插拔注册 ----
@@ -103,25 +127,24 @@ export function Plugin(ctx: PluginContext, config: Config = {}): MediaService {
   // ---- 任务事件转发到 Cordis 事件总线（供 UI 插件订阅）----
   const offQueue = queue.on((e) => {
     if (e.type === 'task:updated') ctx.emit?.('media/task:updated', e.task);
+    else ctx.emit?.('media/artifact:created', { taskId: e.taskId, path: e.path });
   });
 
   // ---- 工具注册：优先宿主 tool-registry，退回事件广播 ----
+  const invoke = (toolName: string, input: any) => handleTool(media, toolName, input, waitTimeoutMs);
   const registry = ctx.toolRegistry ?? ctx.registry?.tool;
   if (registry && typeof registry.register === 'function') {
     for (const def of TOOL_DEFS) {
-      registry.register(def, async (input: any) => handleTool(media, def.name, input));
+      registry.register(def, invoke.bind(null, def.name));
     }
   } else {
-    ctx.emit?.('media/tools:declare', {
-      defs: TOOL_DEFS,
-      invoke: (name: string, input: any) => handleTool(media, name, input)
-    });
+    ctx.emit?.('media/tools:declare', { defs: TOOL_DEFS, invoke });
   }
 
   // ---- 对外提供 media 服务 ----
   ctx.provide('media', media, true);
 
-  // ---- 卸载回收（Cordis 可逆副作用之外的手动清理）----
+  // ---- 卸载回收 ----
   const dispose = async () => {
     queue.close();
     await queue.idle();
@@ -136,25 +159,53 @@ export function Plugin(ctx: PluginContext, config: Config = {}): MediaService {
   return media;
 }
 
-async function handleTool(media: MediaService, tool: string, input: any): Promise<unknown> {
-  switch (tool) {
-    case 'generate_image':
-      return summarize(await media.generateImage(input));
-    case 'edit_image':
-      return summarize(await media.editImage(input));
-    case 'generate_speech':
-      return summarize(await media.generateSpeech(input));
-    case 'generate_video':
-      return summarize(await media.generateVideo(input), true);
-    case 'media_task_status': {
-      if (input.action === 'cancel') {
-        return { canceled: await media.cancel(input.task_id) };
+async function handleTool(media: MediaService, tool: string, input: any, waitTimeoutMs: number): Promise<unknown> {
+  try {
+    switch (tool) {
+      case 'generate_image':
+        return input.wait === false
+          ? summarize(await media.generateImage(input))
+          : viewOrFallback(await media.generateAndWait('image', input, undefined, waitTimeoutMs));
+      case 'edit_image':
+        return input.wait === false
+          ? summarize(await media.editImage(input))
+          : viewOrFallback(await media.generateAndWait('edit', input, undefined, waitTimeoutMs));
+      case 'generate_speech':
+        return input.wait === false
+          ? summarize(await media.generateSpeech(input))
+          : viewOrFallback(await media.generateAndWait('speech', input, undefined, waitTimeoutMs));
+      case 'generate_video':
+        return summarize(await media.generateVideo(input), true);
+      case 'media_task_status': {
+        if (input.action === 'cancel') {
+          return { canceled: await media.cancel(input.task_id) };
+        }
+        return media.taskStatus(input.task_id);
       }
-      return media.taskStatus(input.task_id);
+      default:
+        throw new Error(`unknown tool: ${tool}`);
     }
-    default:
-      throw new Error(`unknown tool: ${tool}`);
+  } catch (e) {
+    // 校验类错误（MediaError retryable=false）直接返回可读信息，Agent 可自行修正参数
+    if (e instanceof MediaError && !e.retryable) return { status: 'rejected', message: e.message };
+    throw e;
   }
+}
+
+function viewOrFallback(v: import('./tools.js').TaskView) {
+  if (v.status === 'succeeded') {
+    return {
+      task_id: v.id, status: v.status, provider: v.provider, modality: v.modality,
+      cost_cny: v.costCny, artifacts: v.artifacts.map((a) => a.path),
+      message: '生成完成'
+    };
+  }
+  return {
+    task_id: v.id, status: v.status, provider: v.provider, modality: v.modality, error: v.error,
+    message: v.status === 'pending' || v.status === 'submitted' || v.status === 'running'
+      ? '等待超时，任务已转后台执行，可用 media_task_status 查询'
+      : undefined
+  };
 }
 
 function summarize(t: import('./protocol.js').TaskRecord, asyncHint = false) {

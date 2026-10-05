@@ -2,21 +2,27 @@
  * dsh-media-comfyui —— 本地 ComfyUI Provider。
  *
  * 原理：把「工作流 JSON（ComfyUI API 格式）」当作模板，
- * 将其中的 {{prompt}} / {{negative}} / {{width}} / {{height}} / {{seed}} 占位符
- * 用请求参数替换后 POST /prompt 提交，轮询 /history/{prompt_id}，
+ * 将其中的 {{prompt}} / {{negative}} / {{width}} / {{height}} / {{seed}} / {{ref_image}}
+ * 占位符用请求参数替换后 POST /prompt 提交，轮询 /queue + /history 拿真实进度，
  * 完成后从 /view 拉取产物。
  *
- * 用户可通过 config.workflows 提供自己的工作流模板（任意 SD/Flux/视频模型），
- * 内置模板仅为最小可跑通的示例（SD1.5 结构）。
+ * 深度优化：
+ *  - 进度反馈：从 /queue 读取排队位次与运行状态，替代盲猜百分比
+ *  - 模板前置校验：提交前检查占位符齐全、存在输出节点，避免跑一半才失败
+ *  - 错误分级：连接失败可重试、模板/参数错误不可重试
  */
 import { readFile } from 'node:fs/promises';
-import type {
-  Artifact,
-  GenerateRequest,
-  MediaProvider,
-  Modality,
-  ProviderTicket,
-  TaskProgress
+import {
+  configError,
+  httpError,
+  MediaError,
+  withTimeout,
+  type Artifact,
+  type GenerateRequest,
+  type MediaProvider,
+  type Modality,
+  type ProviderTicket,
+  type TaskProgress
 } from 'dsh-media-core';
 
 export const name = 'media-comfyui';
@@ -26,6 +32,7 @@ export interface Config {
   /** 模态 → 工作流模板：文件路径（.json）或内联对象 */
   workflows?: Partial<Record<Modality, string | Record<string, unknown>>>;
   timeoutSec?: number;
+  requestTimeoutMs?: number;
 }
 
 interface PluginContext {
@@ -40,70 +47,110 @@ export function Plugin(ctx: PluginContext, config: Config = {}): void {
   ctx.dispose?.(() => ctx.emit?.('media/provider:unregister', provider.id));
 }
 
+/** 视为「输出节点」的 class_type 集合 */
+const OUTPUT_NODES = new Set([
+  'SaveImage', 'PreviewImage', 'SaveAnimatedWEBP', 'SaveAnimatedPNG',
+  'VHS_VideoCombine', 'SaveAudio', 'SaveVideo'
+]);
+
 export class ComfyUIProvider implements MediaProvider {
   readonly id = 'comfyui';
-  /** 默认声明 image；用户提供 video 工作流模板后自动扩展能力 */
   readonly capabilities: Modality[];
 
   private endpoint: string;
   private templates: Partial<Record<Modality, string | Record<string, unknown>>>;
   private timeoutSec: number;
+  private requestTimeoutMs: number;
 
   constructor(config: Config = {}) {
     this.endpoint = (config.endpoint ?? process.env.COMFYUI_ENDPOINT ?? 'http://127.0.0.1:8188').replace(/\/$/, '');
     this.templates = { image: BUILTIN_T2I, ...config.workflows };
     this.timeoutSec = config.timeoutSec ?? 1800;
-    this.capabilities = (Object.keys(this.templates) as Modality[]).filter((m) => m === 'image' || m === 'video' || m === 'image-edit');
+    this.requestTimeoutMs = config.requestTimeoutMs ?? 30_000;
+    this.capabilities = (Object.keys(this.templates) as Modality[]).filter(
+      (m) => m === 'image' || m === 'video' || m === 'image-edit'
+    );
   }
 
   async submit(req: GenerateRequest): Promise<ProviderTicket> {
     const tpl = this.templates[req.modality];
-    if (!tpl) throw new Error(`comfyui 未配置 ${req.modality} 工作流模板`);
+    if (!tpl) throw configError(`comfyui 未配置 ${req.modality} 工作流模板`);
     const workflow = await loadTemplate(tpl);
+
     const [w, h] = parseSize(req.params.size);
-    const filled = fillPlaceholders(workflow, {
+    const vars: Record<string, string> = {
       prompt: req.prompt ?? '',
       negative: String(req.params.negative ?? ''),
       width: String(w),
       height: String(h),
       seed: String(Math.floor(Math.random() * 2 ** 31)),
       ref_image: req.refImage ?? ''
-    });
+    };
+    const filled = fillPlaceholders(workflow, vars) as Record<string, unknown>;
 
-    const res = await fetch(`${this.endpoint}/prompt`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: filled, client_id: `dsh-media-${Date.now()}` })
+    // 模板前置校验：缺占位符值 / 无输出节点 → 不可重试错误，避免白跑
+    validateWorkflow(filled, vars);
+
+    const res = await withTimeout(
+      fetch(`${this.endpoint}/prompt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: filled, client_id: `dsh-media-${Date.now()}` }),
+        signal: AbortSignal.timeout(this.requestTimeoutMs)
+      }),
+      this.requestTimeoutMs + 5000,
+      'comfyui-submit'
+    ).catch((e) => {
+      // 连接失败视为可重试（ComfyUI 可能正在启动）
+      throw new MediaError(`无法连接 ComfyUI（${this.endpoint}）：${(e as Error).message}`, true);
     });
     const data: any = await res.json().catch(() => ({}));
-    if (!res.ok || !data?.prompt_id) {
-      throw new Error(`ComfyUI 提交失败 HTTP ${res.status}: ${JSON.stringify(data).slice(0, 300)}`);
+    if (!res.ok) {
+      throw httpError(res.status, data?.error ?? JSON.stringify(data), 'comfyui');
     }
+    if (!data?.prompt_id) throw new MediaError(`ComfyUI 未返回 prompt_id：${JSON.stringify(data).slice(0, 200)}`, false);
     return { provider: this.id, handle: data.prompt_id, meta: { modality: req.modality, submittedAt: Date.now() } };
   }
 
   async poll(ticket: ProviderTicket): Promise<TaskProgress> {
     if ((Date.now() - Number(ticket.meta?.submittedAt ?? Date.now())) / 1000 > this.timeoutSec) {
-      return { status: 'failed', error: `ComfyUI 任务超时（>${this.timeoutSec}s）` };
+      throw new MediaError(`ComfyUI 任务超时（>${this.timeoutSec}s）`, true);
     }
-    const res = await fetch(`${this.endpoint}/history/${encodeURIComponent(ticket.handle)}`);
-    if (!res.ok) return { status: 'running', percent: 10 };
-    const history: any = await res.json();
-    const entry = history?.[ticket.handle];
-    if (!entry) return { status: 'running', percent: 10 };
-    const st = entry.status?.status_str;
-    if (st === 'error') return { status: 'failed', error: 'ComfyUI 工作流执行出错，详见 ComfyUI 控制台' };
-    if (entry.outputs && Object.keys(entry.outputs).length > 0) {
-      return { status: 'succeeded', percent: 100 };
+    // 终态判定：/history
+    const histRes = await this.get(`/history/${encodeURIComponent(ticket.handle)}`);
+    if (histRes.ok) {
+      const history: any = await histRes.json();
+      const entry = history?.[ticket.handle];
+      if (entry) {
+        if (entry.status?.status_str === 'error') {
+          throw new MediaError('ComfyUI 工作流执行出错，详见 ComfyUI 控制台', false);
+        }
+        if (entry.outputs && Object.keys(entry.outputs).length > 0) {
+          return { status: 'succeeded', percent: 100 };
+        }
+      }
+    }
+    // 进行中：从 /queue 拿排队位次，给出真实进度感
+    const qRes = await this.get('/queue');
+    if (qRes.ok) {
+      const q: any = await qRes.json();
+      const running: any[] = q?.queue_running ?? [];
+      const waiting: any[] = q?.queue_pending ?? [];
+      if (running.some((r) => r?.[1] === ticket.handle)) return { status: 'running', percent: 60 };
+      const pos = waiting.findIndex((r) => r?.[1] === ticket.handle);
+      if (pos >= 0) {
+        return { status: 'running', percent: Math.max(5, Math.min(40, 40 - pos * 5)) }; // 排队中：位次越靠前越高
+      }
     }
     return { status: 'running', percent: 50 };
   }
 
   async fetch(ticket: ProviderTicket): Promise<Artifact[]> {
-    const res = await fetch(`${this.endpoint}/history/${encodeURIComponent(ticket.handle)}`);
+    const res = await this.get(`/history/${encodeURIComponent(ticket.handle)}`);
+    if (!res.ok) throw httpError(res.status, 'history 查询失败', 'comfyui');
     const history: any = await res.json();
     const entry = history?.[ticket.handle];
-    if (!entry?.outputs) throw new Error('ComfyUI 无输出记录');
+    if (!entry?.outputs) throw new MediaError('ComfyUI 无输出记录', true);
     const kind = (ticket.meta?.modality as Modality) ?? 'image';
 
     const arts: Artifact[] = [];
@@ -114,7 +161,7 @@ export class ComfyUIProvider implements MediaProvider {
           subfolder: item.subfolder ?? '',
           type: item.type ?? 'output'
         });
-        const r = await fetch(`${this.endpoint}/view?${params}`);
+        const r = await this.get(`/view?${params}`);
         if (!r.ok) continue;
         arts.push({
           kind,
@@ -124,13 +171,12 @@ export class ComfyUIProvider implements MediaProvider {
         });
       }
     }
-    if (!arts.length) throw new Error('ComfyUI 输出中未找到媒体文件');
+    if (!arts.length) throw new MediaError('ComfyUI 输出中未找到媒体文件', false);
     return arts;
   }
 
-  async cancel(ticket: ProviderTicket): Promise<void> {
-    await fetch(`${this.endpoint}/interrupt`, { method: 'POST' }).catch(() => {});
-    void ticket;
+  async cancel(_ticket: ProviderTicket): Promise<void> {
+    await fetch(`${this.endpoint}/interrupt`, { method: 'POST', signal: AbortSignal.timeout(5000) }).catch(() => {});
   }
 
   async healthCheck(): Promise<boolean> {
@@ -141,19 +187,61 @@ export class ComfyUIProvider implements MediaProvider {
       return false;
     }
   }
+
+  private get(path: string): Promise<Response> {
+    return withTimeout(
+      fetch(this.endpoint + path, { signal: AbortSignal.timeout(this.requestTimeoutMs) }),
+      this.requestTimeoutMs + 5000,
+      'comfyui-get'
+    ).catch((e) => {
+      throw new MediaError(`无法连接 ComfyUI（${this.endpoint}）：${(e as Error).message}`, true);
+    });
+  }
+}
+
+// ---------- 模板校验 ----------
+
+function validateWorkflow(workflow: Record<string, unknown>, vars: Record<string, string>): void {
+  const nodes = Object.values(workflow);
+  if (!nodes.length) throw configError('ComfyUI 工作流模板为空');
+
+  let hasOutput = false;
+  const leftovers = new Set<string>();
+  for (const node of nodes as any[]) {
+    if (node?.class_type && OUTPUT_NODES.has(node.class_type)) hasOutput = true;
+    const scan = (v: unknown) => {
+      if (typeof v === 'string') {
+        for (const m of v.matchAll(/\{\{(\w+)\}\}/g)) {
+          if (!(m[1] in vars)) leftovers.add(m[1]);
+        }
+      } else if (Array.isArray(v)) v.forEach(scan);
+      else if (v && typeof v === 'object') Object.values(v).forEach(scan);
+    };
+    scan(node?.inputs);
+  }
+  if (leftovers.size) {
+    throw configError(`ComfyUI 模板含未知占位符：${[...leftovers].map((v) => `{{${v}}}`).join(', ')}（支持：${Object.keys(vars).map((v) => `{{${v}}}`).join(', ')}）`);
+  }
+  if (!hasOutput) {
+    throw configError(`ComfyUI 模板缺少输出节点（需要 ${[...OUTPUT_NODES].slice(0, 4).join(' / ')} 等），产物无法回收`);
+  }
 }
 
 // ---------- 工具函数 ----------
 
 async function loadTemplate(tpl: string | Record<string, unknown>): Promise<Record<string, unknown>> {
   if (typeof tpl !== 'string') return structuredClone(tpl);
-  return JSON.parse(await readFile(tpl, 'utf-8'));
+  try {
+    return JSON.parse(await readFile(tpl, 'utf-8'));
+  } catch (e) {
+    throw configError(`ComfyUI 工作流模板加载失败（${tpl}）：${(e as Error).message}`);
+  }
 }
 
 /** 深度遍历，替换字符串中的 {{key}} 占位符 */
 function fillPlaceholders(obj: unknown, vars: Record<string, string>): unknown {
   if (typeof obj === 'string') {
-    return obj.replace(/\{\{(\w+)\}\}/g, (_, k) => (k in vars ? vars[k] : `{{${k}}}`));
+    return obj.replace(/\{\{(\w+)\}\}/g, (m, k) => (k in vars ? vars[k] : m));
   }
   if (Array.isArray(obj)) return obj.map((v) => fillPlaceholders(v, vars));
   if (obj && typeof obj === 'object') {

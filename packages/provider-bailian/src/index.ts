@@ -7,15 +7,22 @@
  *  - video      万相图生视频/文生视频（异步任务 + 轮询）
  *  - speech     CosyVoice TTS（同步）
  *
+ * 深度优化：错误分级（4xx 不重试 / 429、5xx 重试）、全请求超时、
+ * usage 真实计费量回传 core 精确结算、参考图本地文件前置校验。
+ *
  * ⚠️ DashScope 处于快速迭代期，模型名与端点以官方文档为准，可在 config.models 覆盖。
  */
-import type {
-  Artifact,
-  GenerateRequest,
-  MediaProvider,
-  Modality,
-  ProviderTicket,
-  TaskProgress
+import {
+  configError,
+  httpError,
+  MediaError,
+  withTimeout,
+  type Artifact,
+  type GenerateRequest,
+  type MediaProvider,
+  type Modality,
+  type ProviderTicket,
+  type TaskProgress
 } from 'dsh-media-core';
 
 export const name = 'media-bailian';
@@ -24,8 +31,8 @@ export interface Config {
   apiKey?: string;
   baseUrl?: string;
   models?: Partial<Record<Modality, string>>;
-  /** 轮询上限（秒），超时按失败处理 */
-  timeoutSec?: number;
+  /** 单请求 HTTP 超时（ms），默认 30s；任务级总超时由 core 控制 */
+  requestTimeoutMs?: number;
 }
 
 const DEFAULT_MODELS: Record<Modality, string> = {
@@ -41,7 +48,6 @@ const MIME_BY_EXT: Record<string, string> = {
 };
 
 interface PluginContext {
-  on(event: string, handler: (...args: any[]) => any): () => void;
   emit?(event: string, ...args: any[]): void;
   dispose?(fn: () => void): void;
   [key: string]: any;
@@ -49,13 +55,8 @@ interface PluginContext {
 
 export function Plugin(ctx: PluginContext, config: Config = {}): void {
   const provider = new BailianProvider(config);
-  // 向 core 注册；卸载时反注册（Cordis 可逆副作用之外的显式清理）
   ctx.emit?.('media/provider:register', provider);
-  const off = ctx.on?.('media/provider:unregister-all', () => {});
-  ctx.dispose?.(() => {
-    ctx.emit?.('media/provider:unregister', provider.id);
-    off?.();
-  });
+  ctx.dispose?.(() => ctx.emit?.('media/provider:unregister', provider.id));
 }
 
 export class BailianProvider implements MediaProvider {
@@ -65,7 +66,7 @@ export class BailianProvider implements MediaProvider {
   private apiKey: string;
   private baseUrl: string;
   private models: Record<Modality, string>;
-  private timeoutSec: number;
+  private requestTimeoutMs: number;
 
   constructor(config: Config = {}) {
     this.apiKey = config.apiKey ?? process.env.DASHSCOPE_API_KEY ?? '';
@@ -74,10 +75,17 @@ export class BailianProvider implements MediaProvider {
     }
     this.baseUrl = (config.baseUrl ?? 'https://dashscope.aliyuncs.com').replace(/\/$/, '');
     this.models = { ...DEFAULT_MODELS, ...config.models };
-    this.timeoutSec = config.timeoutSec ?? 900;
+    this.requestTimeoutMs = config.requestTimeoutMs ?? 30_000;
   }
 
   async submit(req: GenerateRequest): Promise<ProviderTicket> {
+    if (!this.apiKey) throw configError('百炼未配置 API Key（config.apiKey 或 DASHSCOPE_API_KEY）');
+    // DashScope 只接受公网 URL / base64 data URI，本地路径提前拒绝，不进重试
+    for (const [label, v] of [['参考图', req.refImage], ['蒙版', req.mask]] as const) {
+      if (v && !isRemoteRef(v)) {
+        throw configError(`百炼${label}需要公网可访问的 URL 或 data: URI，收到本地路径：${v}（可先上传或使用支持本地文件的 provider，如 comfyui）`);
+      }
+    }
     if (req.modality === 'speech') return this.submitSpeech(req);
     return this.submitAsyncTask(req);
   }
@@ -104,7 +112,7 @@ export class BailianProvider implements MediaProvider {
 
     const data = await this.http(endpoint, { model, input, parameters }, { async: true });
     const taskId = data?.output?.task_id;
-    if (!taskId) throw new Error(`百炼未返回 task_id：${JSON.stringify(data).slice(0, 300)}`);
+    if (!taskId) throw new MediaError(`百炼未返回 task_id：${JSON.stringify(data).slice(0, 300)}`, false);
     return { provider: this.id, handle: taskId, meta: { modality: req.modality, submittedAt: Date.now() } };
   }
 
@@ -120,7 +128,7 @@ export class BailianProvider implements MediaProvider {
       { async: false }
     );
     const url: string | undefined = data?.output?.audio?.url ?? data?.output?.audio?.data;
-    if (!url) throw new Error(`百炼 TTS 未返回音频：${JSON.stringify(data).slice(0, 300)}`);
+    if (!url) throw new MediaError(`百炼 TTS 未返回音频：${JSON.stringify(data).slice(0, 300)}`, false);
     const usage = data?.usage;
     return {
       provider: this.id,
@@ -130,24 +138,51 @@ export class BailianProvider implements MediaProvider {
   }
 
   async poll(ticket: ProviderTicket): Promise<TaskProgress> {
-    if (ticket.meta?.sync) return { status: 'succeeded', percent: 100 };
-    const submittedAt = Number(ticket.meta?.submittedAt ?? Date.now());
-    if ((Date.now() - submittedAt) / 1000 > this.timeoutSec) {
-      return { status: 'failed', error: `任务超时（>${this.timeoutSec}s）` };
+    if (ticket.meta?.sync) {
+      const chars = Number(ticket.meta?.characters ?? 0);
+      return {
+        status: 'succeeded',
+        percent: 100,
+        cost: chars > 0 ? { amount: chars, currency: 'char', cny: 0, quantity: chars / 1000 } : undefined
+      };
     }
     const data = await this.httpGet(`/api/v1/tasks/${encodeURIComponent(ticket.handle)}`);
-    const st: string = data?.output?.task_status ?? 'UNKNOWN';
-    switch (st) {
+    const out = data?.output ?? {};
+    switch (out.task_status as string) {
       case 'SUCCEEDED':
-        return { status: 'succeeded', percent: 100, cost: this.costOf(data?.usage) };
-      case 'FAILED':
-        return { status: 'failed', error: data?.output?.message ?? data?.output?.code ?? '百炼任务失败' };
+        return { status: 'succeeded', percent: 100, cost: this.costFromUsage(data?.usage, ticket) };
+      case 'FAILED': {
+        const msg = out.message ?? out.code ?? '百炼任务失败';
+        // 内容审核/参数类失败不可重试
+        const retryable = !/DataInspection|InvalidParameter|InvalidURL|Arrearage/i.test(String(out.code ?? ''));
+        throw new MediaError(String(msg), retryable);
+      }
       case 'CANCELED':
       case 'UNKNOWN':
         return { status: 'canceled' };
       default:
-        return { status: 'running', percent: 50 }; // PENDING / RUNNING，DashScope 不提供细粒度进度
+        return { status: 'running', percent: this.progressOf(out) };
     }
+  }
+
+  /** 从任务指标估算进度百分比（DashScope 无精确进度，用阶段启发式） */
+  private progressOf(out: any): number {
+    const metrics = out?.task_metrics;
+    if (metrics) {
+      const total = Number(metrics.TOTAL ?? 0);
+      const done = Number(metrics.SUCCEEDED ?? 0);
+      if (total > 0) return Math.min(95, Math.round((done / total) * 100));
+    }
+    return 50;
+  }
+
+  /** usage → CostInfo：回传真实计费量，cny 由 core Pricing 按单价表结算 */
+  private costFromUsage(usage: any, ticket: ProviderTicket): TaskProgress['cost'] {
+    if (!usage) return undefined;
+    const quantity = Number(usage.image_count ?? usage.video_duration ?? usage.video_count ?? 0);
+    if (!quantity) return undefined;
+    void ticket;
+    return { amount: quantity, currency: 'unit', cny: 0, quantity };
   }
 
   async fetch(ticket: ProviderTicket): Promise<Artifact[]> {
@@ -161,13 +196,13 @@ export class BailianProvider implements MediaProvider {
       for (const r of out.results) if (r?.url) urls.push(r.url);
     }
     if (out.video_url) urls.push(out.video_url);
-    if (!urls.length) throw new Error('任务成功但未找到产物 URL');
+    if (!urls.length) throw new MediaError('任务成功但未找到产物 URL', true);
     const kind = (ticket.meta?.modality as Modality) ?? 'image';
     return Promise.all(urls.map((u) => this.download(u, kind)));
   }
 
   async cancel(ticket: ProviderTicket): Promise<void> {
-    // DashScope 通用任务取消端点（部分模型不支持，失败静默）
+    // DashScope 任务取消端点（部分模型不支持，失败静默）
     await this.http(`/api/v1/tasks/${encodeURIComponent(ticket.handle)}/cancel`, {}, { method: 'POST' }).catch(() => {});
   }
 
@@ -175,15 +210,10 @@ export class BailianProvider implements MediaProvider {
     if (!this.apiKey) return false;
     try {
       await this.httpGet('/api/v1/tasks/healthcheck-nonexistent');
-      return true; // 401 之外的响应都说明网络与鉴权链路可达
+      return true; // 401 之外的响应说明网络与鉴权链路可达
     } catch (e) {
       return !/401|Unauthorized|InvalidApiKey/.test((e as Error).message);
     }
-  }
-
-  private costOf(_usage: any): TaskProgress['cost'] {
-    // 百炼 usage 单位口径不一，成本统一交由 core Pricing 单价表折算，这里不透传以免覆盖预算记账
-    return undefined;
   }
 
   private async download(urlOrData: string, kind: Modality): Promise<Artifact> {
@@ -191,8 +221,8 @@ export class BailianProvider implements MediaProvider {
       const b64 = urlOrData.split(',')[1] ?? '';
       return { kind, mime: 'audio/mpeg', data: Buffer.from(b64, 'base64') };
     }
-    const res = await fetch(urlOrData);
-    if (!res.ok) throw new Error(`下载产物失败 HTTP ${res.status}: ${urlOrData.slice(0, 120)}`);
+    const res = await fetch(urlOrData, { signal: AbortSignal.timeout(this.requestTimeoutMs * 2) });
+    if (!res.ok) throw httpError(res.status, await res.text().catch(() => ''), 'bailian-download');
     const buf = new Uint8Array(await res.arrayBuffer());
     const mime = res.headers.get('content-type')?.split(';')[0] ?? MIME_BY_EXT[extOf(urlOrData)] ?? 'application/octet-stream';
     return { kind, mime, data: buf, filename: decodeURIComponent(urlOrData.split('/').pop()?.split('?')[0] ?? '') };
@@ -204,26 +234,42 @@ export class BailianProvider implements MediaProvider {
       'Content-Type': 'application/json'
     };
     if (opts.async) headers['X-DashScope-Async'] = 'enable';
-    const res = await fetch(this.baseUrl + path, {
-      method: opts.method ?? 'POST',
-      headers,
-      body: opts.method === 'POST' || !opts.method ? JSON.stringify(body) : undefined
-    });
-    const data = await res.json().catch(() => ({}));
+    const res = await withTimeout(
+      fetch(this.baseUrl + path, {
+        method: opts.method ?? 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.requestTimeoutMs)
+      }),
+      this.requestTimeoutMs + 5000,
+      'dashscope-request'
+    );
+    const data: any = await res.json().catch(() => ({}));
     if (!res.ok) {
-      throw new Error(`DashScope HTTP ${res.status}: ${data?.message ?? data?.code ?? JSON.stringify(data).slice(0, 200)}`);
+      throw httpError(res.status, data?.message ?? data?.code ?? JSON.stringify(data), 'bailian');
     }
     return data;
   }
 
   private async httpGet(path: string): Promise<any> {
-    const res = await fetch(this.baseUrl + path, { headers: { Authorization: `Bearer ${this.apiKey}` } });
-    const data = await res.json().catch(() => ({}));
+    const res = await withTimeout(
+      fetch(this.baseUrl + path, {
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        signal: AbortSignal.timeout(this.requestTimeoutMs)
+      }),
+      this.requestTimeoutMs + 5000,
+      'dashscope-get'
+    );
+    const data: any = await res.json().catch(() => ({}));
     if (!res.ok && res.status !== 404) {
-      throw new Error(`DashScope HTTP ${res.status}: ${data?.message ?? ''}`);
+      throw httpError(res.status, data?.message ?? '', 'bailian');
     }
     return data;
   }
+}
+
+function isRemoteRef(v: string): boolean {
+  return v.startsWith('http://') || v.startsWith('https://') || v.startsWith('data:') || v.startsWith('oss://');
 }
 
 function extOf(url: string): string {
